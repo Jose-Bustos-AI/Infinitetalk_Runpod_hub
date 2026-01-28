@@ -1,16 +1,15 @@
 import runpod
 import os
 import websocket
-import base64
 import json
 import uuid
 import logging
 import urllib.request
 import urllib.parse
 import subprocess
-import shutil
 import time
 import requests
+import glob
 
 # -------------------------
 # Logging
@@ -30,15 +29,22 @@ def download_file_from_url(url: str, output_path: str) -> str:
     try:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
+        # -L follow redirects, retries for transient issues
         result = subprocess.run(
-            ["wget", "-O", output_path, "--no-verbose", "--timeout=30", url],
+            ["wget", "-L", "-O", output_path, "--no-verbose", "--timeout=30", "--tries=3", "--retry-connrefused", url],
             capture_output=True,
             text=True,
-            timeout=90,
+            timeout=120,
         )
 
-        if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            logger.info(f"✅ Download OK: {url} -> {output_path} ({os.path.getsize(output_path)} bytes)")
+        if (
+            result.returncode == 0
+            and os.path.exists(output_path)
+            and os.path.getsize(output_path) > 0
+        ):
+            logger.info(
+                f"✅ Download OK: {url} -> {output_path} ({os.path.getsize(output_path)} bytes)"
+            )
             return output_path
 
         raise Exception(f"wget failed: {result.stderr}")
@@ -56,8 +62,8 @@ def load_workflow(workflow_path: str):
 
 def queue_prompt(prompt):
     url = f"http://{server_address}:8188/prompt"
-    p = {"prompt": prompt, "client_id": client_id}
-    data = json.dumps(p).encode("utf-8")
+    payload = {"prompt": prompt, "client_id": client_id}
+    data = json.dumps(payload).encode("utf-8")
 
     req = urllib.request.Request(url, data=data)
     req.add_header("Content-Type", "application/json")
@@ -84,7 +90,11 @@ def get_history(prompt_id: str):
 def view_download(filename: str, subfolder: str, folder_type: str) -> bytes:
     """Download a file from ComfyUI /view endpoint."""
     url = f"http://{server_address}:8188/view"
-    data = {"filename": filename, "subfolder": subfolder or "", "type": folder_type or "output"}
+    data = {
+        "filename": filename,
+        "subfolder": subfolder or "",
+        "type": folder_type or "output",
+    }
     url_values = urllib.parse.urlencode(data)
     with urllib.request.urlopen(f"{url}?{url_values}") as response:
         return response.read()
@@ -92,7 +102,7 @@ def view_download(filename: str, subfolder: str, folder_type: str) -> bytes:
 
 def wait_for_comfyui():
     http_url = f"http://{server_address}:8188/"
-    max_http_attempts = 180  # ~3min
+    max_http_attempts = 240  # ~4min
     for i in range(max_http_attempts):
         try:
             urllib.request.urlopen(http_url, timeout=5)
@@ -105,7 +115,13 @@ def wait_for_comfyui():
 
 
 def run_workflow_and_get_output_file(prompt) -> str:
-    """Run workflow and return a local mp4 path."""
+    """
+    Run workflow and return a local mp4 path.
+    Robust strategy:
+      1) Inspect history outputs (videos/gifs/images) and take fullpath if present
+      2) If only filename/subfolder/type exists, download via /view
+      3) Fallback to filesystem scan /ComfyUI/output/**/*.mp4 (newest)
+    """
     wait_for_comfyui()
 
     ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
@@ -139,47 +155,73 @@ def run_workflow_and_get_output_file(prompt) -> str:
 
     ws.close()
 
-    history = get_history(prompt_id).get(prompt_id)
+    history_all = get_history(prompt_id)
+    history = history_all.get(prompt_id)
     if not history:
         raise Exception("No history returned for prompt_id.")
 
     outputs = history.get("outputs", {})
-    if not outputs:
-        raise Exception("No outputs found in history.")
+    logger.info(f"🧾 history.outputs node count = {len(outputs)}")
 
-    # Try to locate video from outputs: accept keys "gifs" or "videos"
+    # DEBUG: log keys per node (so we see real structure)
+    for nid, nout in outputs.items():
+        try:
+            logger.info(f"🔎 node {nid} keys: {list(nout.keys())}")
+        except Exception:
+            pass
+
+    # 1) Try history outputs
     for node_id, node_output in outputs.items():
-        for key in ("videos", "gifs"):
+        for key in ("videos", "gifs", "images"):
             items = node_output.get(key)
-            if not items:
+            if not items or not isinstance(items, list):
                 continue
 
-            # Choose first produced file
-            item = items[0]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
 
-            # Case A: direct fullpath available
-            fullpath = item.get("fullpath")
-            if fullpath and os.path.exists(fullpath) and os.path.getsize(fullpath) > 0:
-                logger.info(f"✅ Output found via fullpath (node {node_id}): {fullpath}")
-                return fullpath
+                fullpath = item.get("fullpath")
+                if fullpath and os.path.exists(fullpath) and os.path.getsize(fullpath) > 0:
+                    logger.info(f"✅ Output via fullpath (node {node_id}): {fullpath}")
+                    return fullpath
 
-            # Case B: use /view endpoint (filename/subfolder/type)
-            filename = item.get("filename")
-            subfolder = item.get("subfolder", "")
-            folder_type = item.get("type", "output")
+                filename = item.get("filename")
+                subfolder = item.get("subfolder", "")
+                folder_type = item.get("type", "output")
+                if filename:
+                    logger.info(
+                        f"✅ Output via /view (node {node_id}): {filename} subfolder={subfolder} type={folder_type}"
+                    )
+                    data = view_download(filename, subfolder, folder_type)
 
-            if filename:
-                logger.info(f"✅ Output found via /view (node {node_id}): {filename} subfolder={subfolder} type={folder_type}")
-                data = view_download(filename, subfolder, folder_type)
-                temp_dir = f"/tmp/{uuid.uuid4()}"
-                os.makedirs(temp_dir, exist_ok=True)
-                local_path = os.path.join(temp_dir, filename)
-                with open(local_path, "wb") as f:
-                    f.write(data)
-                if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
-                    return local_path
+                    tmp_dir = f"/tmp/{uuid.uuid4()}"
+                    os.makedirs(tmp_dir, exist_ok=True)
+                    local_path = os.path.join(tmp_dir, filename)
 
-    raise Exception("Could not find video output in history (no gifs/videos).")
+                    with open(local_path, "wb") as f:
+                        f.write(data)
+
+                    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+                        # Ensure .mp4 extension for uploads
+                        if not local_path.lower().endswith(".mp4"):
+                            mp4_path = local_path + ".mp4"
+                            os.rename(local_path, mp4_path)
+                            local_path = mp4_path
+                        return local_path
+
+    # 2) Fallback: scan filesystem for newest MP4
+    logger.warning("⚠️ No output found in history outputs. Falling back to filesystem scan /ComfyUI/output.")
+    candidates = sorted(
+        glob.glob("/ComfyUI/output/**/*.mp4", recursive=True),
+        key=lambda p: os.path.getmtime(p),
+        reverse=True,
+    )
+    if candidates:
+        logger.info(f"✅ Output via filesystem: {candidates[0]}")
+        return candidates[0]
+
+    raise Exception("Could not find video output in history AND no mp4 found in /ComfyUI/output.")
 
 
 def supabase_upload_file(local_path: str, dest_path: str, content_type: str = "video/mp4") -> str:
@@ -222,11 +264,8 @@ def handler(job):
     # URL-only strict validation
     image_url = job_input.get("image_url")
     wav_url = job_input.get("wav_url")
-
     if not image_url or not wav_url:
-        return {
-            "error": "URL-only mode: you must provide image_url and wav_url."
-        }
+        return {"error": "URL-only mode: you must provide image_url and wav_url."}
 
     # Optional params
     prompt_text = job_input.get("prompt", "A person talking naturally")
@@ -255,7 +294,7 @@ def handler(job):
 
     prompt = load_workflow(workflow_path)
 
-    # Ensure output is saved (stability)
+    # Safety: ensure output saving is enabled for VHS node if present
     if "131" in prompt and "inputs" in prompt["131"]:
         prompt["131"]["inputs"]["save_output"] = True
 
@@ -263,7 +302,7 @@ def handler(job):
     if "128" in prompt and prompt["128"].get("class_type") == "WanVideoSampler":
         prompt["128"].setdefault("inputs", {})["force_offload"] = force_offload
 
-    # Inject paths & params using your known node IDs
+    # Inject paths & params using known node IDs
     required_nodes = ["284", "125", "241", "245", "246", "270"]
     for nid in required_nodes:
         if nid not in prompt:
