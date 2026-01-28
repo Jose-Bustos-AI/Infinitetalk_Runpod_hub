@@ -2,13 +2,13 @@
 set -e
 
 echo "Starting ComfyUI in the background..."
-python /ComfyUI/main.py --listen 0.0.0.0 --port 8188 --use-sage-attention &
+python /ComfyUI/main.py --listen 0.0.0.0 --port 8188 &
 
 echo "Waiting for ComfyUI to be ready..."
-max_wait=180
+max_wait=240
 wait_count=0
 while [ $wait_count -lt $max_wait ]; do
-    if curl -s http://127.0.0.1:8188/ > /dev/null 2>&1; then
+    if curl -sSf http://127.0.0.1:8188/ > /dev/null 2>&1; then
         echo "ComfyUI is ready!"
         break
     fi
