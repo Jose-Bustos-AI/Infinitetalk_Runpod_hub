@@ -14,7 +14,7 @@
       "base_precision": "fp16_fast",
       "quantization": "fp8_e4m3fn",
       "load_device": "offload_device",
-      "attention_mode": "sageattn",
+      "attention_mode": "sdpa",
       "block_swap_args": [
         "134",
         0
