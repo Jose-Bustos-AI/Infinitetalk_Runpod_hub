@@ -1,8 +1,6 @@
-# Use specific version of nvidia cuda image
 FROM wlsdml1114/engui_genai-base:1.9 as runtime
 
-# wget + ffmpeg (ffmpeg recomendado para audios mp3/raros)
-RUN apt-get update && apt-get install -y wget ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y wget curl ffmpeg && rm -rf /var/lib/apt/lists/*
 
 RUN pip install -U "huggingface_hub[hf_transfer]"
 RUN pip install runpod websocket-client librosa requests
